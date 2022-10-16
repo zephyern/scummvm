@@ -53,6 +53,188 @@ Common::String generateLogFileName(Agi::AgiGame *state, Agi::AgiEngine *vm) {
 								  date.tm_min,
 								  date.tm_sec);
 }
+
+/// Safely get a character from our string.
+/// If index is out of bounds, we return 0.
+char getChar(Common::String &message, int index) {
+	if (index >= message.size() || index < 0) {
+		return 0;
+	}
+	return message[index];
+}
+
+/// Parses a numeric value after the given index.
+/// 
+/// The index parameter is advanced to the last digit of the number.
+/// 
+/// If there's no number, then -1 is returned.
+int getNumber(Common::String &message, int &index) {
+	int number = -1;
+
+	char digit = getChar(message, index + 1);
+	while (digit >= '0' && digit <= '9') {
+		index++;
+
+		if (number == -1) {
+			number = 0;
+		}
+		number *= 10;
+		number += digit - '0';
+
+		digit = getChar(message, index + 1);
+	}
+
+	return number;
+	
+}
+
+/// There are two special format characters in AGI's log() function:
+/// * Percent Sign: %
+/// * Backslash: \
+///
+/// We resolve these here to create the formatted message. For details, see the cmdLog function.
+Common::String messageFormat(const char *messageStr, Agi::AgiGame *state, Agi::AgiEngine *vm) {
+	Common::String messageFormatted;
+
+	Common::String message{messageStr};
+	for (int i = 0; i < message.size(); i++) {
+		char thisChar = message[i];
+		if (thisChar == '%') {
+			i++; // Consume the %
+			char nextChar = getChar(message, i);
+
+			switch (nextChar) {
+			case 'g': {
+				// Prints a message from logic zero.
+				int number = getNumber(message, i);
+				if (state->logics[0].texts != nullptr && (number - 1) <= state->logics[0].numTexts) {
+					messageFormatted += state->logics[0].texts[number - 1];
+				} else {
+					messageFormatted += "?";
+				}
+				break;
+			}
+			case 'm': {
+				// Prints a message from the current logic.
+				int number = getNumber(message, i);
+				if (state->_curLogic->texts != nullptr && (number - 1) <= state->_curLogic->numTexts) {
+					messageFormatted += state->_curLogic->texts[number - 1];
+				} else {
+					messageFormatted += "?";
+				}
+				break;
+			}
+			case 'o': {
+				// Prints an object's name.
+				int number = getNumber(message, i);
+				uint numObjs = vm->_objects.size();
+				if (number >= 0 && number < numObjs) {
+					messageFormatted += vm->_objects[number].name;
+				} else {
+					messageFormatted += "?";
+				}
+				break;
+			}
+			case 's': {
+				// Prints a string from the string table.
+				int number = getNumber(message, i);
+				if (number >= 0 && number <= MAX_STRINGS) {
+					messageFormatted += state->strings[number];
+				} else {
+					messageFormatted += "?";
+				}
+				break;
+			}
+			case 'v': {
+				// Prints the value of a variable.
+				int number = getNumber(message, i);
+				if (number >= 0 && number < MAX_VARS) {
+					Common::String varValue = Common::String::format("%hhu", vm->getVar(number));
+
+					char nextNextChar = getChar(message, i + 1);
+					if (nextNextChar == '|') {
+						i++; // Consume the |
+						int number = getNumber(message, i);
+						if (number > 0) {
+							int width = number - varValue.size();
+							for (int zeros = 0; zeros < width; zeros++) {
+								varValue.insertChar('0', 0);
+							}
+						}
+					}
+
+					messageFormatted += varValue;
+				} else {
+					messageFormatted += "?";
+				}
+				break;
+			}
+			case 'w': {
+				// Prints a word typed by the user.
+				int number = getNumber(message, i);
+				uint16 numWords = vm->_words->getEgoWordCount();
+				if (number >= 1 && number <= numWords) {
+					messageFormatted += vm->_words->getEgoWord(number - 1);
+				} else {
+					messageFormatted += "?";
+				}
+				break;
+			}
+			case 0: {
+				// End of string.
+				break;
+			}
+			default: {
+				// Invalid escape code, just continue after skipping the percent sign.
+				messageFormatted += nextChar;
+				break;
+			}
+			}
+		} else if (thisChar == '\\') {
+			i++;
+			char nextChar = getChar(message, i);
+
+			switch (nextChar) {
+			case 'n': {
+				// \n prints \n (new line)
+				messageFormatted += '\n';
+				break;
+			}
+			case '\"': {
+				// \" prints "
+				messageFormatted += '"';
+				break;
+			}
+			case '\\': {
+				char nextNextChar = getChar(message, i + 1);
+				if (nextNextChar == '%') {
+					i++; // Consume the %
+					// \\% prints %
+					messageFormatted += '%';
+				} else {
+					// \\ prints \ (backslash)
+					messageFormatted += '\\';
+				}
+				break;
+			}
+			case 0: {
+				// End of string.
+				break;
+			}
+			default: {
+				// Invalid escape code, just continue after skipping the backslash.
+				messageFormatted += nextChar;
+				break;
+			}
+			}
+		} else {
+			// Not part of an escape code.
+			messageFormatted += thisChar;
+		}
+	}
+
+	return messageFormatted;
+}
 } // namespace
 
 namespace Agi {
@@ -818,22 +1000,21 @@ void cmdInitDisk(AgiGame *state, AgiEngine *vm, uint8 *parameter) {             
 //   Input line : <text>
 //   <message>
 //
-// This is not yet a complete implementation of log(). There
-// is a follow-up item which is planned to be addressed.
+// == Message Formatting ==
+// The message can be formatted using the following codes:
+// * %g<number>: the text of the message with this number from message field of logic 0 is inserted at this place.
+// * %m<number>: the text of the message with the given number (in this same logic) is inserted at this place.
+// * %o<number>: the name of the inventory item that has an index number equal to the value of the variable given by <number> is inserted at this place.
+// * %s<number>: the text of the string with the given number is inserted at this place.
+// * %v<number>: at this place the output will include a decimal value of variable with the given number.
+// * %v<number>|<width>: same as %v, but adds leading zeros so the number is the size of width.
+// * %w<number>: the text of the player - entered word with the given index number is inserted at this place. (The index is 'one based'; i.e.first word is % w1, second is % w2, etc.)
 //
-// == No Log Formatting ==
-// We just log the message literally without
-// processing. According to the docs, you can use variables in the message, like:
-//
-// log("Unknown word: %w1"); [ This should log the first word the user typed.
-//
-// Other format codes include:
-// %g<number>: the text of the message with this number from message field of logic 0 is inserted at this place.
-// %m<number>: the text of the message with the given number(in this same logic) is inserted at this place.
-// %o<number>: the name of the inventory item that has an index number equal to the value of the variable given by <number> is inserted at this place.
-// %s<number>: the text of the string with the given number is inserted at this place.
-// %v<number>: at this place the output will include a decimal value of variable with the given number.
-// %w<number>: the text of the player - entered word with the given index number is inserted at this place. (The index is 'one based'; i.e.first word is % w1, second is % w2, etc.)
+// Additionally, the following escape sequences are supported:
+// * \n: New line
+// * \\: Actually logs a \
+// * \": Logs a "
+// * \\%: Logs a %
 //
 void cmdLog(AgiGame *state, AgiEngine *vm, uint8 *parameter) {
 	uint16 textNr = parameter[0];
@@ -842,10 +1023,11 @@ void cmdLog(AgiGame *state, AgiEngine *vm, uint8 *parameter) {
 		const char *inputLine = (char *)vm->_text->_promptPrevious;
 		const char *message = state->_curLogic->texts[textNr - 1];
 
+		Common::String messageFormatted = messageFormat(message, state, vm);
 		Common::String logMessage = Common::String::format("Room %hhu\nInput line : %s\n%s\n",
 														   currentRoom,
 														   inputLine,
-														   message);
+														   messageFormatted.c_str());
 
 		// Logs to the console. To see, use arguments: --debugflags=Scripts -d 1
 		debugCN(1, kDebugLevelScripts, "%s", logMessage.c_str());
